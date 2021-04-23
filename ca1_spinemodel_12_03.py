@@ -1,0 +1,557 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+
+#### Global constants:
+rtol = 1e-7
+atol = 1e-7 
+F = 96485.33 ## Coulomb/mole
+Nav = 6.022e23
+e = 2.718
+
+class ca1_spine:
+    
+    def __init__(self, g_N, nRyR, n_ip3, Vsoce, tau_refill, Vspine):
+        """initialize the spine parameters and volume/surface area-dependent constants: 
+        params: (nmda conductance (pS), #ryr, #ip3rs, Vsoce, tau_refill (s), Vspine(um^3))"""
+        #self.g_N = float(g_N) * 1e-12 # pS
+        self.g_N = float(g_N) * 1e-12 #S Use baseline as 675 pS
+        self.ryr_tot = int(nRyR)
+        self.ip3r_tot = int(n_ip3)
+        self.tau_refill = float(tau_refill)
+        self.Vsoc = float(Vsoce)
+        #self.Vscale = float(Vscale)
+        #self.k_sk = float(k_sk)
+        self.Vspine = float(Vspine) ## in um^3
+        self.Vspine_um = self.Vspine ## use this variable to get Vspine in um anywhere required
+        self.d_spine = (6*self.Vspine/3.14)**0.333  ## um
+        self.Aspine = 3.14 * self.d_spine**2 * 1e-8  ## cm^2
+        self.Vspine = self.Vspine * 1e-15 ## liter
+        self.Aer = 0.1 * self.Aspine  ## cm^2
+        self.Ver = 0.1 * self.Vspine ## liter
+        self.Vspine = self.Vspine - self.Ver   ## liter
+        #self.Vspine_um - self.Vspine * 1e15 ##um^3 for scaling AMPA conductance
+            ## Total concentration of PMCA and NCX pumps in the spine head (uM):
+        #self.pHtot = (1e14) * 1000 * self.Aspine/(self.Nav * self.Vspine)
+        #self.pLtot = (1e14) * 140 * self.Aspine/(self.Nav * self.Vspine)
+                ######################################################################################
+        self.g_N_Ca = 0.1 * (self.g_N/(2*F*78.0*self.ca_ext)) * 1e6   ## Ca conductance of NMDAR channels; liter/sec
+        self.k_erleak = self.Vmax_serca * (self.ca_0**2)/((self.Kd_serca**2 + self.ca_0**2)*(self.ca_er_0 - self.ca_0)) #+ self.alpha_ip3r * self.ip3r_tot * (((0.1/(0.1+self.d1))*(0.05/(0.05 + self.d5))*1)**3) * (self.ca_er_0 - self.ca_0)/(self.Nav * self.Vspine * 0.1) ## /s
+        self.g_A =  ((self.Vspine_um * 1e2 - 1.0)/20.0) * 1e-9 ## S    #formerly: 0.5e-9 ## Vspine = Vmin * (1 + 20gA), Vmin = 0.01 um^3 
+        print(f'gAMPA = {self.g_A}')
+        
+        
+        ##############################################################################################
+    #### Defining various functions used in model simulation:
+
+    ##############################################################################################
+    #### Temporal profile of glutamate availability:
+
+    def glu(self, flag, t):
+
+        tau_glu = 1e-3 ## sec
+        glu_0 = 2.718 * 300 ## uM
+
+        if flag == 0: 
+            return 0
+        else: 
+            total = 0
+            for tpuff in self.tpre:    
+                if t > tpuff: total += glu_0 * np.exp(-(t-tpuff)/tau_glu) * ((t-tpuff)/tau_glu)
+            return total
+    ##############################################################################################
+
+    ##############################################################################################
+    #### Voltage profile of BAP at the dendritic compartment:
+
+    def u_bpap(self, t):
+
+        V0 = 67
+        total = 0
+        for tbp in self.tpost:
+            if t > tbp: total += V0 * (0.7 * np.exp(-(t-tbp)/0.003) + 0.3 * np.exp(-(t-tbp)/0.04))
+        return self.E_L + total
+    ##############################################################################################
+
+    ##############################################################################################    
+    #### AMPAR conductance profile: 
+
+    def I_A(self,flag,u,t):
+
+        if flag==0:
+            return 0
+        else:
+            total = 0
+            for tpuff in self.tpre:
+                if t>tpuff: total += self.g_A * (np.exp(-(t-tpuff)/self.tau_A2) - np.exp(-(t-tpuff)/self.tau_A1))  
+            return total * (u - self.E_A)
+    ##############################################################################################
+
+    ##############################################################################################     
+    #### NMDAR conductance profile:
+
+    def xr(self, flag, t):
+        if flag==0:
+            return 0
+        else:
+            tot = 0
+            for tpuff in self.tpre:
+                if t>tpuff: tot += np.exp(-(t-tpuff)/self.tau_r)
+            return 100*tot
+        
+    ##############################################################################################        
+    #### Plasticitry model, Omega function
+
+    def wfun(self,x):
+
+        U = -self.beta2*(x - self.alpha2)
+        V = -self.beta1*(x - self.alpha1)
+        if U>100: U = 100
+        if V>100: V = 100        
+        return (1.0/(1 + np.exp(U))) - 0.5*(1.0/(1 + np.exp(V)))
+    ##############################################################################################
+
+    ##############################################################################################    
+    #### Plasticity model, tau function
+
+    def wtau(self,x):
+
+        return self.P1 + (self.P2/(self.P3 + (2*x/(self.alpha1+self.alpha2))**self.P4))
+    ##############################################################################################
+    
+        #########################################################################################################################       
+    #### Coupled ODEs describing the ER-bearing spine head, which is resistively coupled to a dendritic compartement via a passive neck:       
+
+    def spine_model(self, x , t):
+
+        R_Gq,Gact,IP3,ca_Gact_PLC_PIP2,DAGdegr,PLC_PIP2,DAG,IP3_IP5P,IP3degr,glu_R_Gq,Gbc,ca_PLC,IP3_IP3K_2ca,R,ca_PLC_PIP2,IP3K_2ca,Gact_PLC_PIP2,Gq,IP5P,GaGDP,ca_Gact_PLC,glu_R,IP3K,\
+        ryrC1, ryrC2, ryrC3, ryrC4, ryrO1, ryrO2, ryrO3, pH, pL, cbp, Bslow, calb, calb_m1, calb_h1, calb_m2, calb_h2, calb_m1h1, calb_m2h1, calb_m1h2, c1n0, c2n0, c0n1, c0n2, c1n1, c2n1, c1n2, c2n2, erB1, erB2, sr, ir,\
+         Psoc, mv, hv, w, u, ud, h, ca_er, ca = x
+
+        nt = self.glu(self.flag, t)
+
+        if self.flag and self.input_pattern=='stdp': ud = self.u_bpap(t)
+        #u,ud = [SCdep,SCdep]
+
+        ## mGluR-IP3 pathway:    
+
+        R_Gq_eq = -self.a2f * R_Gq * nt + self.a2b * glu_R_Gq + self.a3f * R *Gq - self.a3b * R_Gq
+        Gact_eq = +self.a5 * glu_R_Gq + self.a6*Gq - self.a7 * Gact - self.b3f * Gact * PLC_PIP2 + self.b3b * Gact_PLC_PIP2 - self.b4f * Gact * ca_PLC_PIP2 + self.b4b * ca_Gact_PLC_PIP2 - self.b5f * ca_PLC * Gact + self.b5b * ca_Gact_PLC
+
+        IP3_eq = +self.b6 * ca_PLC_PIP2 + self.b7 * ca_Gact_PLC_PIP2 - 100 * IP3K_2ca * IP3 + 80 * IP3_IP3K_2ca - 9 * IP5P * IP3 + 72 * IP3_IP5P #+ 1.2
+
+        ca_Gact_PLC_PIP2_eq = +self.b2f * ca * Gact_PLC_PIP2 - self.b2b * ca_Gact_PLC_PIP2 + self.b4f * Gact * ca_PLC_PIP2 - self.b4b * ca_Gact_PLC_PIP2 - self.b11 * ca_Gact_PLC_PIP2 + self.b9f * ca_Gact_PLC * self.PIP2 - self.b9b * ca_Gact_PLC_PIP2 - self.b7 * ca_Gact_PLC_PIP2
+        DAGdegr_eq = +self.DAGdegrate*DAG
+        PLC_PIP2_eq = -self.b1f*ca*PLC_PIP2 + self.b1b*ca_PLC_PIP2 - self.b3f*Gact*PLC_PIP2 + self.b3b*Gact_PLC_PIP2 + self.b10*Gact_PLC_PIP2
+        DAG_eq = +self.b6*ca_PLC_PIP2 + self.b7*ca_Gact_PLC_PIP2 - self.DAGdegrate*DAG
+        IP3_IP5P_eq = +9*IP5P*IP3 - 72*IP3_IP5P - 18*IP3_IP5P
+        IP3degr_eq = +20*IP3_IP3K_2ca + 18*IP3_IP5P
+        glu_R_Gq_eq = +self.a2f*R_Gq*nt - self.a2b*glu_R_Gq + self.a4f*glu_R*Gq - self.a4b*glu_R_Gq - self.a5*glu_R_Gq
+        Gbc_eq = +self.a5*glu_R_Gq + self.a6*Gq - self.a8*GaGDP*Gbc
+        ca_PLC_eq = -self.b8f*ca_PLC*self.PIP2 + self.b8b*ca_PLC_PIP2 + self.b6*ca_PLC_PIP2 - self.b5f*ca_PLC*Gact + self.b5b*ca_Gact_PLC + self.b12*ca_Gact_PLC
+        IP3_IP3K_2ca_eq = +100*IP3K_2ca*IP3 - 80*IP3_IP3K_2ca - 20*IP3_IP3K_2ca
+        R_eq = -self.a1f*R*nt + self.a1b*glu_R - self.a3f*R*Gq + self.a3b*R_Gq
+        ca_PLC_PIP2_eq = +self.b1f*ca*PLC_PIP2 - self.b1b*ca_PLC_PIP2 - self.b4f*Gact*ca_PLC_PIP2 + self.b4b*ca_Gact_PLC_PIP2 + self.b11*ca_Gact_PLC_PIP2 + self.b8f*ca_PLC*self.PIP2 - self.b8b*ca_PLC_PIP2 - self.b6*ca_PLC_PIP2
+        IP3K_2ca_eq = +1111*IP3K*ca*ca - 100*IP3K_2ca - 100*IP3K_2ca*IP3 + 80*IP3_IP3K_2ca + 20*IP3_IP3K_2ca
+        Gact_PLC_PIP2_eq = -self.b2f*ca*Gact_PLC_PIP2 + self.b2b*ca_Gact_PLC_PIP2 + self.b3f*Gact*PLC_PIP2 - self.b3b*Gact_PLC_PIP2 - self.b10*Gact_PLC_PIP2
+        Gq_eq = -self.a3f*R*Gq + self.a3b*R_Gq - self.a4f*glu_R*Gq + self.a4b*glu_R_Gq - self.a6*Gq + self.a8*GaGDP*Gbc
+        IP5P_eq = -9*IP5P*IP3 + 72*IP3_IP5P + 18*IP3_IP5P
+        GaGDP_eq = +self.a7*Gact - self.a8*GaGDP*Gbc + self.b10*Gact_PLC_PIP2 + self.b11*ca_Gact_PLC_PIP2 + self.b12*ca_Gact_PLC
+        ca_Gact_PLC_eq = -self.b9f*ca_Gact_PLC*self.PIP2 + self.b9b*ca_Gact_PLC_PIP2 + self.b7*ca_Gact_PLC_PIP2 + self.b5f*ca_PLC*Gact - self.b5b*ca_Gact_PLC - self.b12*ca_Gact_PLC
+        glu_R_eq = +self.a1f*R*nt - self.a1b*glu_R - self.a4f*glu_R*Gq + self.a4b*glu_R_Gq + self.a5*glu_R_Gq
+        IP3K_eq = -1111*IP3K*ca*ca + 100*IP3K_2ca
+
+        ca_eq = (-self.b1f*ca*PLC_PIP2 - self.b2f*ca*Gact_PLC_PIP2 - 1111*IP3K*ca*ca - 1111*IP3K*ca*ca + (self.b1b*ca_PLC_PIP2 + self.b2b*ca_Gact_PLC_PIP2 + 100*IP3K_2ca+100*IP3K_2ca)) 
+
+        ## IP3 receptor kinetics:
+
+        x = IP3/(IP3 + self.d1)
+        y = ca/(ca + self.d5)
+        Q2 = self.Kinh #(0.1+IP3)/(0.9+IP3)#Kinh
+        h_eq = self.a2*(Q2 - (Q2+ca)*h)
+
+        ca_eq += self.ip3r_tot * ((x*y*h)**3) * self.alpha_ip3r * (ca_er - ca)/(Nav * self.Vspine) 
+
+        ca_er_eq = -self.alpha_ip3r * self.ip3r_tot * ((x*y*h)**3) * (ca_er - ca)/(Nav * self.Ver)  +  (self.ca_er_0 - ca_er)/self.tau_refill
+
+        ## RyR/CICR kinetics:
+
+        ryrC5 = 1.0 - (ryrC1 + ryrC2 + ryrC3 + ryrC4 + ryrO1 + ryrO2 + ryrO3)
+        ryrC1_eq = -self.kryrc1c2*ca*ryrC1 + self.kryrc2c1*ryrC2
+        ryrC2_eq = self.kryrc1c2*ca*ryrC1 - self.kryrc2c1*ryrC2 - self.kryrc2c3*ca*ryrC2 + self.kryrc3c2*ryrC3 - self.kryrc2c5*ryrC2 + self.kryrc5c2*ryrC5
+        ryrC3_eq = self.kryrc2c3*ca*ryrC2 - self.kryrc3c2*ryrC3 - self.kryrc3o1*ryrC3 + self.kryro1c3*ryrO1 - self.kryrc3o2*ryrC3 + self.kryro2c3*ryrO2 - self.kryrc3o3*ryrC3 + self.kryro3c3*ryrO3
+        ryrC4_eq = self.kryro2c4*ryrO2 - self.kryrc4o2*ryrC4 + self.kryro3c4*ryrO3 - self.kryrc4o3*ryrC4
+        ryrO1_eq = self.kryrc3o1*ryrC3 - self.kryro1c3*ryrO1
+        ryrO2_eq = self.kryrc3o2*ryrC3 - self.kryro2c3*ryrO2 - self.kryro2c4*ryrO2 + self.kryrc4o2*ryrC4
+        ryrO3_eq = self.kryrc3o3*ryrC3 - self.kryro3c3*ryrO3 - self.kryro3c4*ryrO3 + self.kryrc4o3*ryrC4
+        ryr_eq =  [ryrC1_eq, ryrC2_eq, ryrC3_eq, ryrC4_eq, ryrO1_eq, ryrO2_eq, ryrO3_eq]
+
+        ca_eq += self.ryr_tot * (ryrO1+ryrO2+ryrO3) * self.alpha_ryr * (ca_er - ca)/(Nav * self.Vspine)
+
+        ca_er_eq += -self.ryr_tot * (ryrO1+ryrO2+ryrO3) * self.alpha_ryr * (ca_er - ca)/(Nav * self.Ver) 
+
+        rho_ryr = (1e6)*self.ryr_tot/(Nav * self.Vspine)
+        ca_eq += (-self.kryrc1c2*ca*ryrC1 + self.kryrc2c1*ryrC2 - self.kryrc2c3*ca*ryrC2 + self.kryrc3c2*ryrC3) * rho_ryr
+
+        ## Buffer equations:
+
+        Bslow_eq = -self.kslow_f*Bslow*ca + self.kslow_b*(self.Bslow_tot - Bslow)
+        ca_eq += -self.kslow_f*Bslow*ca + self.kslow_b*(self.Bslow_tot - Bslow)
+
+        cbp_eq = -self.kbuff_f*ca*cbp + self.kbuff_b*(self.cbp_tot - cbp)
+        ca_eq += -self.kbuff_f*ca*cbp + self.kbuff_b*(self.cbp_tot - cbp)    
+
+        calb_m2h2 = self.calb_tot - calb - calb_m1 - calb_h1 - calb_m2 - calb_h2 - calb_m1h1 - calb_m2h1 - calb_m1h2
+        calb_eqs = [ -ca*calb*(self.km0m1 + self.kh0h1) + self.km1m0*calb_m1 + self.kh1h0*calb_h1,\
+                         ca*calb*self.km0m1 - self.km1m0*calb_m1 + calb_m2*self.km2m1 - ca*calb_m1*self.km1m2 + calb_m1h1*self.kh1h0 - ca*calb_m1*self.kh0h1,\
+                         ca*calb*self.kh0h1 - self.kh1h0*calb_h1 + calb_h2*self.kh2h1 - ca*calb_h1*self.kh1h2 + calb_m1h1*self.km1m0 - ca*calb_h1*self.km0m1,\
+                         ca*calb_m1*self.km1m2 - self.km2m1*calb_m2 + self.kh1h0*calb_m2h1 - ca*self.kh0h1*calb_m2,\
+                         ca*calb_h1*self.kh1h2 - self.kh2h1*calb_h2 + self.km1m0*calb_m1h2 - ca*self.km0m1*calb_h2,\
+                         ca*(calb_h1*self.km0m1 + calb_m1*self.kh0h1) - (self.km1m0+self.kh1h0)*calb_m1h1 - ca*calb_m1h1*(self.km1m2+self.kh1h2) + self.kh2h1*calb_m1h2 + self.km2m1*calb_m2h1,\
+                         ca*self.km1m2*calb_m1h1 - self.km2m1*calb_m2h1 + self.kh2h1*calb_m2h2 - self.kh1h2*ca*calb_m2h1 + self.kh0h1*ca*calb_m2 - self.kh1h0*calb_m2h1,\
+                         ca*self.kh1h2*calb_m1h1 - self.kh2h1*calb_m1h2 + self.km2m1*calb_m2h2 - self.km1m2*ca*calb_m1h2 + self.km0m1*ca*calb_h2 - self.km1m0*calb_m1h2 ]
+        ca_eq += -ca*(self.km0m1*(calb+calb_h1+calb_h2) + self.kh0h1*(calb+calb_m1+calb_m2) + self.km1m2*(calb_m1+calb_m1h1+calb_m1h2) + self.kh1h2*(calb_h1+calb_m1h1+calb_m2h1))+\
+                    self.km1m0*(calb_m1+calb_m1h1+calb_m1h2) + self.kh1h0*(calb_h1+calb_m1h1+calb_m2h1) + self.km2m1*(calb_m2+calb_m2h1+calb_m2h2) + self.kh2h1*(calb_h2+calb_m1h2+calb_m2h2)
+
+        ##ER Ca2+ buffer:
+
+        erB1_eq = -self.kerb1_f*erB1*ca_er + self.kerb1_b*(self.erB1_tot - erB1)
+        erB2_eq = -self.kerb2_f*erB2*ca_er + self.kerb2_b*(self.erB2_tot - erB2)
+        ca_er_eq += -self.kerb1_f*erB1*ca_er + self.kerb1_b*(self.erB1_tot - erB1) - self.kerb2_f*erB2*ca_er + self.kerb2_b*(self.erB2_tot - erB2)
+
+        ## Ca2+/calmodulin kinetics:
+
+        c0n0 = self.cam_tot - c1n0 - c2n0 - c0n1 - c0n2 - c1n1 - c2n1 - c1n2 - c2n2
+        c1n0_eq = -(self.k2c_on*ca + self.k1c_off + self.k1n_on*ca)*c1n0 + self.k1c_on*ca*c0n0 + self.k2c_off*c2n0 + self.k1n_off*c1n1
+        c2n0_eq = -(self.k2c_off + self.k1n_on*ca)*c2n0 + self.k2c_on*ca*c1n0 + self.k1n_off*c2n1
+        c0n1_eq = -(self.k2n_on*ca + self.k1n_off + self.k1c_on*ca)*c0n1 + self.k1n_on*ca*c0n0 + self.k2n_off*c0n2 + self.k1c_off*c1n1
+        c0n2_eq = -(self.k2n_off + self.k1c_on*ca)*c0n2 + self.k2n_on*ca*c0n1 + self.k1c_off*c1n2
+        c1n1_eq = -(self.k2c_on*ca + self.k1c_off + self.k1n_off + self.k2n_on*ca)*c1n1 + self.k1c_on*ca*c0n1 + self.k1n_on*ca*c1n0 + self.k2c_off*c2n1 + self.k2n_off*c1n2
+        c2n1_eq = -(self.k2c_off + self.k2n_on*ca)*c2n1 + self.k2c_on*ca*c1n1 + self.k2n_off*c2n2 + self.k1n_on*ca*c2n0 - self.k1n_off*c2n1
+        c1n2_eq = -(self.k2n_off + self.k2c_on*ca)*c1n2 + self.k2n_on*ca*c1n1 + self.k2c_off*c2n2 + self.k1c_on*ca*c0n2 - self.k1c_off*c1n2
+        c2n2_eq = -(self.k2c_off + self.k2n_off)*c2n2 + self.k2c_on*ca*c1n2 + self.k2n_on*ca*c2n1
+        cam_eqs = [c1n0_eq, c2n0_eq, c0n1_eq, c0n2_eq, c1n1_eq, c2n1_eq, c1n2_eq, c2n2_eq]
+        ca_eq += -ca*(self.k1c_on*(c0n0+c0n1+c0n2) + self.k1n_on*(c0n0+c1n0+c2n0) + self.k2c_on*(c1n0+c1n1+c1n2) + self.k2n_on*(c0n1+c1n1+c2n1)) + \
+        self.k1c_off*(c1n0+c1n1+c1n2) + self.k1n_off*(c0n1+c1n1+c2n1) + self.k2c_off*(c2n0+c2n1+c2n2) + self.k2n_off*(c0n2+c1n2+c2n2)
+
+        ## PMCA/NCX kinetics:
+
+        #ca_eq += pH*kH_leak - ca*pH*k1H + k2H*(pHtot - pH)  +  pL*kL_leak - ca*pL*k1L + k2L*(pLtot - pL)
+        pH_eq = 0#k3H*(pHtot - pH) - ca*pH*k1H + k2H*(pHtot - pH)
+        pL_eq = 0#k3L*(pLtot - pL) - ca*pL*k1L + k2L*(pLtot - pL)
+
+        ## Extrusion kinetics:
+        ca_eq += -(6.0/self.d_spine)*200*5*((ca/(ca+20.0)) - (self.ca_0/(self.ca_0+20.0)))  ## Low-aff pump
+        ca_eq += -(6.0/self.d_spine)*200*0.5*((ca/(ca+0.5)) - (self.ca_0/(self.ca_0+0.5))) ## High-aff pump
+
+        ca_eq += -((4.4e-15)/self.Vspine)*(ca - self.ca_0)  ## Diffusion into dendrite via neck
+
+        ## SERCA kinetics:
+
+        ca_eq += -self.Vmax_serca * (ca**2)/((self.Kd_serca**2) + (ca**2)) + self.k_erleak*(ca_er - ca)
+
+        ## SOCE kinetics:
+        Psoc_eq = (((self.Ksoc**4)/(self.Ksoc**4 + ca_er**4)) - Psoc)/self.tau_soc
+        ca_eq += self.Vsoc * Psoc
+
+        ## VGCC equations:
+
+        mv_eq = ((1.0/(1 + np.exp(-(u-self.um)/self.kmv))) - mv)/self.tau_mv
+        hv_eq = ((1.0/(1 + np.exp(-(u-self.uh)/self.khv))) - hv)/self.tau_hv
+        I_vgcc = -0.001 * Nav * (3.2e-19) * self.g_vgcc * (mv**2) * hv * 0.078 * u * (ca - self.ca_ext*np.exp(-0.078*u))/(1 - np.exp(-0.078*u))
+
+        ## NMDA-R kinetics:
+
+        sr_eq = self.xr(self.flag, t)*(1-sr-ir) - (sr/self.tau_d) - self.k_des*sr
+        ir_eq = self.k_des*sr - self.k_rec*ir
+
+        Inmda = self.g_N * sr * (u - self.E_N)/(1.0 + 0.28 * np.exp(-0.062 * u))
+
+        ## Spine and dendrite voltage eqns:
+
+    #     if dep_flag:
+    #         sp_hh_eq = 0
+    #         dend_hh_eq = 0
+    #     else: 
+        sp_hh_eq = -(1/self.Cmem) * ( self.g_L*(u - self.E_L) + (self.I_A(self.flag,u,t)/self.Aspine) + (Inmda/self.Aspine) - (self.gc/self.Aspine)*(ud - u) - I_vgcc/self.Aspine)
+            #sp_hh_eq = -(1/Cmem) * ( g_L*(u - E_L) + I_A(s,u,t)/Aspine + I_N(s,u,t)/Aspine - (gc/Aspine)*(ud - u) - I_vgcc/Aspine)
+        dend_hh_eq = -(1/self.Cmem) * ( self.g_L*(ud - self.E_L) + self.rho_spines*self.gc*(ud - u))
+
+        ## Ca2+ influx through NMDAR and VGCC:
+
+        ca_eq += -(self.g_N_Ca/self.Vspine) * (Inmda/(self.g_N*(u - self.E_N))) * 0.078 * u * (ca - self.ca_ext*np.exp(-0.078*u))/(1 - np.exp(-0.078*u)) \
+                -(self.g_vgcc/self.Vspine) * (mv**2) * hv * 0.078 * u * (ca - self.ca_ext*np.exp(-0.078*u))/(1 - np.exp(-0.078*u))
+        #ca_eq += -(g_N_Ca/Vspine) * (I_N(s,u,t)/(g_N*(u - E_N))) * 0.078 * u * (ca - ca_ext*np.exp(-0.078*u))/(1 - np.exp(-0.078*u)) \
+        #        -(g_vgcc/Vspine) * (mv**2) * hv * 0.078 * u * (ca - ca_ext*np.exp(-0.078*u))/(1 - np.exp(-0.078*u))   
+
+        ## Equation for plasticity variable w:
+
+        acam = self.cam_tot - c0n0    
+        w_eq = (1.0/self.wtau(acam))*(self.wfun(acam) - w)
+
+        return [R_Gq_eq,Gact_eq,IP3_eq,ca_Gact_PLC_PIP2_eq,DAGdegr_eq,PLC_PIP2_eq,DAG_eq,IP3_IP5P_eq,IP3degr_eq,glu_R_Gq_eq,Gbc_eq,ca_PLC_eq,IP3_IP3K_2ca_eq,\
+                R_eq,ca_PLC_PIP2_eq,IP3K_2ca_eq,Gact_PLC_PIP2_eq,Gq_eq,IP5P_eq,GaGDP_eq,ca_Gact_PLC_eq,glu_R_eq,IP3K_eq]+\
+                ryr_eq + [pH_eq, pL_eq, cbp_eq, Bslow_eq] + calb_eqs + cam_eqs + [erB1_eq, erB2_eq] + [sr_eq, ir_eq] + [Psoc_eq] + [mv_eq, hv_eq] + [w_eq] + [sp_hh_eq, dend_hh_eq,\
+                h_eq, ca_er_eq, ca_eq]
+
+
+    ################################### Defining Constants #######################################
+        ## Reaction paramters for ER buffer:
+    kerb1_f,kerb1_b = [0.1,200] ## /uM/s,/s
+    erB1_tot = 3600*30  ## uM
+    kerb2_f,kerb2_b = [100,1000] ## /uM/s,/s
+    erB2_tot = 3600  ## uM
+    
+        ## Reaction parameters for mGluR_IP3 pathway:
+    PIP2 = 4000  ## uM
+    a1f = 11.1 ## /uM/s
+    a1b = 2  ## 100 /s
+    a2f = 11.1 ## /uM/s
+    a2b = 2  ## 100 /s
+    a3f = 2 ## /uM/s
+    a3b = 100 ## /s
+    a4f = 2 ## /uM/s
+    a4b = 100 ## /s
+    a5 = 116  ## 116 /s
+    a6 = 0.001 ## /s
+    a7 = 0.02 ## /s
+    a8 = 6 ## /s
+    b1f = 300 ## /uM/s
+    b1b = 100 ## /s
+    b2f = 900 ## /uM/s
+    b2b = 30 ## /s
+    b3f = 800 ## /uM/s
+    b3b = 40 ## /s
+    b4f = 1200 ## /uM/s
+    b4b = 6 ## /s
+    b5f = 1200 ## /uM/s
+    b5b = 6 ## /s
+    b6 = 2 ## /s
+    b7 = 160 ## /s
+    b8f = 1 ## /uM/s
+    b8b = 170 ## /s
+    b9f = 1 ## /uM/s
+    b9b = 170 ## /s
+    b10 = 8 ## /s
+    b11 = 2  ## 8 /s
+    b12 = 8 ## /s
+    DAGdegrate = 0.15 ## /s
+
+    ## Parameters for IP3R model (Fink et al., 2000 and Vais et al., 2010):
+    Kinh = 0.2  ## uM
+    d1 = 0.8 ## uM
+    d5 = 0.3 ## uM
+    a2 = 2.7 ## /uM/s
+    alpha_ip3r = (0.15/3.2)*(1e7)*(1e6)/500.0  ## /uM/sec
+
+        # Parameters for Saftenku et al. RyR model:
+    kryrc1c2 = 1.24 #2.5  /uM/s
+    kryrc2c1 = 13.6 #13.3
+    kryrc2c3 = 29.8 #68 /uM/s
+    kryrc3c2 = 3867 #8000
+    kryrc3o2  = 24.5 #17
+    kryro2c3 = 156.5 #92
+    kryro2c4 = 1995 #1900
+    kryrc4o2 = 415.3 #520
+    kryrc3o3 = 8.5 #14
+    kryro3c3 = 111.7 #138
+    kryro3c4 = 253.3 #300
+    kryrc4o3 = 43 #46
+    kryrc3o1 = 731.2 #1100
+    kryro1c3 = 4183 #3400
+    kryrc2c5 = 1.81 #0.13
+    kryrc5c2 = 3.63 #3.6
+    alpha_ryr = (0.1/3.2)*(1e7)*(1e6)/500.0  ## /uM/sec
+    
+        ## Parameters for endogenous immobile buffer (CBP): 
+    kbuff_f = 247 ## /uM/s
+    kbuff_b = 524 ## /s
+
+    ## Parameters for endogenous slow buffer:
+    kslow_f = 24.7 ## /uM/s
+    kslow_b = 52.4 ## /s
+
+    ## Parameters for calbindin-Ca2+ kinetics:
+    km0m1=174 ## /uM/s
+    km1m2=87 ## /uM/s
+    km1m0=35.8 ## /s
+    km2m1=71.6 ## /s
+    kh0h1=22 ## /uM/s
+    kh1h2=11 ## /uM/s
+    kh1h0=2.6 ## /s
+    kh2h1=5.2 ## /s
+    
+        ## Parameters for PMCA and NCX pumps:
+    k1H,k2H,k3H,kH_leak = [150,15,12,3.33]  ## (/uM/s, /s, /s, /s)
+    k1L,k2L,k3L,kL_leak = [300,300,600,10]  ## (/uM/s, /s, /s, /s)
+
+    ## Parameters for CaM-Ca2+ interaction:
+    k1c_on = 6.8  ## /uM/s
+    k1c_off = 68  ## /s
+    k2c_on = 6.8 ## /uM/s
+    k2c_off = 10 ## /s
+    k1n_on = 108 ## /uM/s
+    k1n_off = 4150 ## /s
+    k2n_on = 108 ## /uM/s
+    k2n_off = 800 ## /s
+
+    ## Membrane and leak parameters:
+    Cmem = 1e-6 ##  F/cm^2
+    g_L = 2e-4  ## S/cm^2
+    E_L = -70   ## mV
+
+    ## AMPA receptor parameters:
+    tau_A1 = 0.2e-3 ## s
+    tau_A2 = 2e-3  ## s
+    E_A = 0  ## mV
+    #g_A = 0.5e-9  ## S
+
+    ## NMDA receptor parameters:
+    k_des,k_rec = [10.0,2.0]
+    tau_r = 2e-3
+    tau_d = 89e-3
+    #tau_N1 = 5e-3 ## s
+    #tau_N2 = 50e-3 ## s
+    E_N = 0  ## mV
+
+    ## L-VGCC parameters:
+    um = -20 ## mV
+    kmv = 5  ## mV
+    tau_mv = 0.08e-3 ## sec
+    uh = -65  ## mV
+    khv = -7 ## mV
+    tau_hv = 300e-3  ## sec
+
+    ## Spine neck parameters:
+    Rneck = 1e8  ## Ohm
+    gc = 1.0/Rneck ## S
+    rho_spines = 0#1.5e6 ## Surface density of co-active SC synaptic inputs on dendritic compartment (cm^-2)
+
+    ## SERCA kinetic parameters:
+    Vmax_serca = 1  ## uM/sec
+    Kd_serca = 0.2 ## uM
+
+    ## SOCE paramters:
+    Ksoc = 50.0 ## uM
+    tau_soc = 0.1  ## sec
+    #Vsoc = 1.  ## uM/sec
+
+    ## Parameters for Ca2+-based plasticity model:
+    P1,P2,P3,P4 = [1.0,10.0,0.001,2]
+    beta1,beta2 = [60,60]  ## /uM
+    alpha1,alpha2 = [2.0,20.0] ## uM
+
+        #########################################################
+    ########### Concentrations of various species ###########
+    #########################################################
+
+    ## External Ca (uM):
+    ca_ext = 2e3
+
+    ## Resting cytosolic Ca (uM):
+    ca_0 = 0.05
+
+    ## Resting Ca in ER (uM):
+    ca_er_0 = 250. 
+
+    ## Total calbindin concentration in spine (uM):
+    calb_tot = 45.
+
+    ## Total CBP concentration in the spine (uM):
+    cbp_tot = 80.
+
+    ## Total slow buffer concentration in the spine (uM):
+    Bslow_tot = 40.
+
+    ## Total concentration of PMCA and NCX pumps in the spine head (uM):
+    pHtot = 0 #(1e14) * 1000 * Aspine/(Nav * Vspine)
+    pLtot = 0 #(1e14) * 140 * Aspine/(Nav * Vspine)
+
+    ## Total concentration of CaM in spine (uM):
+    cam_tot = 50.
+
+    ## Total concentrations of IP3 3-kinase and IP3 5-phosphatase in the spine (uM):
+    ip5pconc = 1.
+    ip3kconc = 0.9
+    
+    ################################################################################################################
+    ############################################### Experiments ##################################################
+    ################### simulate ER+ spine without inputs to cnverge to steady state #############
+    def get_resting_params(self):
+        """simulates the spine in absence of inputs and returns the resting state params"""
+        if (self.ryr_tot == 0 and self.ip3r_tot == 0):
+            self.buff_flag = 0
+            self.Vmax_serca = 0
+            self.k_erleak = 0
+            self.V_socc_max = 0
+            
+        self.flag = 0
+        self.buff_flag = 1
+        self.g_vgcc = 0
+        self.input_pattern="rdp"
+        ##########################################################################################################
+        ######################## Initializing all variables:######################################################
+        ########################################################################################################
+
+        mGluR_init = [0,0,0,0,0,0.8,0,0,0,0,0,0,0,0.3,0,0,0,1.0,self.ip5pconc,0,0,0,self.ip3kconc]
+        ryr_init = [1,0,0,0,0,0,0]
+        pumps_init = [self.pHtot, self.pLtot]
+        buff_init =  [self.cbp_tot, self.Bslow_tot] + [self.calb_tot,0,0,0,0,0,0,0] 
+        CaM_init = [0]*8  
+        erB_init = [self.erB1_tot,self.erB2_tot]
+        nmda_init = [0,0]
+        soc_init = [0]
+        vgcc_init = [0,1] 
+        w_init = [0] 
+        voltage_init = [self.E_L, self.E_L]
+        h_init = [1]
+        ca_init = [self.ca_er_0, self.ca_0]
+
+        xinit0 = mGluR_init + ryr_init + pumps_init + buff_init + CaM_init + erB_init + nmda_init + soc_init + vgcc_init + w_init + voltage_init + h_init + ca_init
+
+
+        #print(xinit0)
+
+        ################ solving #################################################
+        t0 = np.arange(0., 1000., 0.01)
+        sol0 = odeint(self.spine_model, xinit0, t0, rtol=rtol, atol=atol) #args=(self.Vspine, self.g_A)
+        print("initial ER calcium = {}".format(sol0[-1,-2]))
+        print("initial cyto calcium = {}".format(sol0[-1,-1]))
+        print(f"Vspine={self.Vspine}")
+
+
+        return sol0[-1,:]
+    
+    
+    ######################################### RDP ################################################################
+
+    def do_rdp(self, f_input, n_inputs):
+        """performs RDP 
+        parameters: (frequency of stimulation, no. of presynaptic inputs)"""
+        if (self.ryr_tot == 0 and self.ip3r_tot == 0):
+            self.buff_flag = 0
+            self.Vmax_serca = 0
+            self.k_erleak = 0
+            self.V_socc_max = 0
+            
+        xinit = self.get_resting_params()
+        self.flag = 1
+        self.buff_flag = 1
+        self.tpre = [i/float(f_input) for i in range(n_inputs)]
+        t = np.linspace(min(self.tpre), max(self.tpre) + 1., 10000)
+        sol = odeint(self.spine_model,xinit, t, rtol = rtol, atol = atol) #, args=(self.Vspine, self.g_A)
+        #plt.plot(sol[:,-11])
+        ################ saving in a file ######################
+        #fname = "rdp_out_vinit{}_nryr{}_f{}.csv".format(round(self.Vspine * 1e15, 2), self.nRyR, f_input)
+        return sol
+
+    
+
+    
+    
+
+
+    
+    
+
+
