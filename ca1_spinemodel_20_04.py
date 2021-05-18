@@ -136,8 +136,7 @@ class ca1_spine:
 
         if self.flag and self.input_pattern=='stdp': ud = self.u_bpap(t)
         else: u,ud = [self.E_L + self.scDep,self.E_L + self.scDep]
-
-        ## mGluR-IP3 pathway:  
+ 
         ## mGluR-IP3 pathway:    
 
         IP3_IP3K_2ca = self.IP3K_tot - IP3K - IP3K_2ca
@@ -436,7 +435,7 @@ class ca1_spine:
     ## Parameters for Ca2+-based plasticity model:
     P1,P2,P3,P4 = [1.0,10.0,0.001,2]
     beta1,beta2 = [60,60]  ## /uM
-    alpha1,alpha2 = [2.0,20.0] ## uM
+    alpha1,alpha2 = [6.04641385849974,25.688044233956496] ## uM
 
         #########################################################
     ########### Concentrations of various species ###########
@@ -543,7 +542,7 @@ class ca1_spine:
         if f_input < 0.3: n_points = int(3e4)
         else: n_points = int(1e4)
             
-        t = np.linspace(min(self.tpre), max(self.tpre) + 1., n_points)
+        t = np.linspace(min(self.tpre), max(self.tpre), n_points)
         sol = odeint(self.spine_model,xinit, t, rtol = rtol, atol = atol) #, args=(self.Vspine, self.g_A)
         #plt.plot(sol[:,-11])
         ################ saving in a file ######################
@@ -551,13 +550,13 @@ class ca1_spine:
         return sol
     
     def cam_trace(self, sol):
-        return [np.sum(sol[i,42:50]) for i in range(sol.shape[0])]
+        return [np.sum(sol[i,26:34]) for i in range(sol.shape[0])]
     
     def ryr_flux(self, sol):
-        return [self.alpha_ryr * self.ryr_tot * (o1+o2+o3) * (ca_er - ca)/(Nav * self.Vspine) for o1,o2,o3,ca_er,ca in zip(sol[:,27],sol[:,28],sol[:,29],sol[:,-2],sol[:,-1])]
+        return [self.alpha_ryr * self.ryr_tot * (o1+o2+o3) * (ca_er - ca)/(Nav * self.Vspine) for o1,o2,o3,ca_er,ca in zip(sol[:,11],sol[:,12],sol[:,13],sol[:,-2],sol[:,-1])]
     
     def ip3_flux(self, sol):
-        open_prob = [((ip3/(ip3 + self.d1))*(ca/(ca + self.d5))*h)**3 for ip3,ca,h in zip(sol[:,2],sol[:,-1],sol[:,-3])]
+        open_prob = [((ip3/(ip3 + self.d1))*(ca/(ca + self.d5))*h)**3 for ip3,ca,h in zip(sol[:,3],sol[:,-1],sol[:,-3])]
         return [self.alpha_ip3r * self.ip3r_tot * op * (ca_er - ca)/(Nav * self.Vspine) for op,ca_er,ca in zip(open_prob,sol[:,-2],sol[:,-1])]
     
     def nmda_flux(self, sol):
