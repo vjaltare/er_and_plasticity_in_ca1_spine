@@ -37,10 +37,22 @@ The `ca1_spinemodel.py` file contains the biophysical model of the CA1 dendritic
   - `f_burst_min`, `f_burst_max`: min and max frequency of spikes in a burst. Avg freq of each burst is sampled from a uniform distribution [`f_burst_min`, `f_burst_max`]  
   - `max_inputs`: max inputs in a burst. For each burst no. of inputs is sampled from a uniform distribution [1, `max_inputs`]
 
-### Theta-burst protocol
-Under construction
 
-## Fantastic biophysical models of signaling proteins and where to find them...
+## Runing the model
+---
+
+1. Save the `ca1_spinemodel_12_06.py` file in the same folder as your script or iPython file.
+2. Run the following commands to import numpy, matplotlib and the CA1 spine model <br>
+`import numpy as np` <br>
+`import matplotlib.pyplot as plt` <br>
+`from ca1_spinemodel_12_06.py import *`
+3. After this, declare a parametrized object with specific details of the spine. <br>
+`ca1_spine1 = ca1_spine(g_N, #nRyR, #n_ip3, Vsoce_0, tau_refill_0, Vspine, scDep)` <br>
+4. Now call the method to perform desired experiment. For instance, if you want to simulate Schaffer Collateral Place Field firing patterns, call <br>
+`sol, t = ca1_spine1.sc_inputs(self, beta_pre, beta_post, tmax, f_burst_min, f_burst_max, max_inputs)`
+5. Visualize the simulation results using matplotlib. `sol` contains the solution to the system of ODEs and `t` contains the time series vector.
+
+
 
 
 
